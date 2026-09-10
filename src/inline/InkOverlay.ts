@@ -1264,6 +1264,15 @@ export class InkOverlayPlugin {
 	private lassoActive = false;
 	private dragFrom: { x: number; y: number } | null = null;
 	private dragTotal: { dx: number; dy: number } | null = null;
+	// ---- lasso resize (ported from justwrite) --------------------------------
+	// A resize reuses dragFrom/dragTotal to drive the same pointer-move
+	// plumbing a plain drag does; these four just say WHICH handle is held
+	// and what the selection looked like when the gesture grabbed it, so
+	// lassoMove can compute a scale factor instead of a translation.
+	private resizeHandle: "nw" | "ne" | "sw" | "se" | "n" | "e" | "s" | "w" | null = null;
+	private resizeStartBounds: BBox | null = null;
+	private resizeLastBounds: BBox | null = null;
+	private resizeOriginal: InkStroke[] | null = null;
 	/** Insert-space gesture: divider world y, or null when no gesture. */
 	private spaceLineY: number | null = null;
 	/** Ids frozen at pen-down; the live drag and the op both use this list. */
@@ -4962,6 +4971,39 @@ export class InkOverlayPlugin {
 		return this.selection.bounds(this.strokesHere(), () => null, () => null);
 	}
 
+	/**
+	 * Which resize handle (if any) a world-space point is near, for a given
+	 * selection box. Ported from justwrite: eight grab points, corners and
+	 * edge midpoints, picked by nearest-within-pad rather than an exact hit,
+	 * since a fingertip or a pen tip is never pixel-exact over a 4px dot.
+	 */
+	private selectionHandleAt(
+		p: { x: number; y: number },
+		b: BBox
+	): "nw" | "ne" | "sw" | "se" | "n" | "e" | "s" | "w" | null {
+		const pad = visualToNote(12, this.scale);
+		const pts: Array<["nw" | "ne" | "sw" | "se" | "n" | "e" | "s" | "w", number, number]> = [
+			["nw", b.x, b.y],
+			["ne", b.x + b.width, b.y],
+			["sw", b.x, b.y + b.height],
+			["se", b.x + b.width, b.y + b.height],
+			["n", b.x + b.width / 2, b.y],
+			["e", b.x + b.width, b.y + b.height / 2],
+			["s", b.x + b.width / 2, b.y + b.height],
+			["w", b.x, b.y + b.height / 2],
+		];
+		let best: (typeof pts)[number][0] | null = null;
+		let bestD = pad;
+		for (const [name, x, y] of pts) {
+			const d = Math.hypot(p.x - x, p.y - y);
+			if (d <= bestD) {
+				bestD = d;
+				best = name;
+			}
+		}
+		return best;
+	}
+
 	private lassoDown(sample: PenSample): void {
 		// One call site for both paths into a lasso gesture - a fresh loop
 		// and grabbing an existing selection to drag both reach here, from
@@ -4973,6 +5015,23 @@ export class InkOverlayPlugin {
 		this.showLassoCursor(sample);
 		const w = this.camera.screenToWorld(sample.x, sample.y);
 		const bounds = this.selectionBounds();
+		// A handle takes priority over a plain grab: it sits ON the box's
+		// edge, exactly where the grab-pad below would otherwise also fire.
+		const handle = bounds ? this.selectionHandleAt(w, bounds) : null;
+		if (bounds && handle) {
+			this.resizeHandle = handle;
+			this.resizeStartBounds = { ...bounds };
+			this.resizeLastBounds = { ...bounds };
+			// A deep-enough copy that undo can hand back exactly what was
+			// there before the resize, the same shape `dispatchInk`'s
+			// "replace" op expects from the eraser's own commit above.
+			this.resizeOriginal = this.strokesHere()
+				.filter((s) => this.selection.hasStroke(s.id))
+				.map((s) => ({ ...s, points: s.points.map((p) => ({ ...p })), bbox: { ...s.bbox } }));
+			this.dragFrom = { x: w.x, y: w.y };
+			this.dragTotal = { dx: 0, dy: 0 };
+			return;
+		}
 		// Landing inside an existing selection moves it; anywhere else lassos.
 		if (
 			bounds &&
@@ -5012,6 +5071,62 @@ export class InkOverlayPlugin {
 			const path = this.filePath();
 			if (!path) return;
 			const w = this.camera.screenToWorld(last.x, last.y);
+			if (this.resizeHandle && this.resizeStartBounds && this.resizeLastBounds) {
+				const sb = this.resizeStartBounds;
+				const min = 8 / this.scale;
+				const fixedX = this.resizeHandle.includes("w")
+					? sb.x + sb.width
+					: this.resizeHandle.includes("e")
+						? sb.x
+						: sb.x + sb.width / 2;
+				const fixedY = this.resizeHandle.includes("n")
+					? sb.y + sb.height
+					: this.resizeHandle.includes("s")
+						? sb.y
+						: sb.y + sb.height / 2;
+				let sx =
+					this.resizeHandle.includes("w") || this.resizeHandle.includes("e")
+						? this.resizeHandle.includes("w")
+							? (fixedX - w.x) / sb.width
+							: (w.x - fixedX) / sb.width
+						: 1;
+				let sy =
+					this.resizeHandle.includes("n") || this.resizeHandle.includes("s")
+						? this.resizeHandle.includes("n")
+							? (fixedY - w.y) / sb.height
+							: (w.y - fixedY) / sb.height
+						: 1;
+				if (this.resizeHandle.length === 2) {
+					// Corner resize is uniform: independent x/y scales is a
+					// non-uniform affine transform, and it visibly skews
+					// diagonal handwriting into something that reads as a
+					// rotation. Preserve the original aspect ratio instead.
+					const scale = Math.max(sx, sy, min / Math.min(sb.width, sb.height));
+					sx = scale;
+					sy = scale;
+				} else {
+					if (sx < min / sb.width) sx = min / sb.width;
+					if (sy < min / sb.height) sy = min / sb.height;
+				}
+				const lastW = this.resizeLastBounds.width || 1;
+				const lastH = this.resizeLastBounds.height || 1;
+				const lastSX = (sx * sb.width) / lastW;
+				const lastSY = (sy * sb.height) / lastH;
+				inlineInk.scaleStrokes(path, this.selection.strokeIds, { x: fixedX, y: fixedY }, lastSX, lastSY);
+				this.resizeLastBounds = {
+					x: fixedX + (this.resizeHandle.includes("w") ? -Math.abs(sx * sb.width) : 0),
+					y: fixedY + (this.resizeHandle.includes("n") ? -Math.abs(sy * sb.height) : 0),
+					width: Math.abs(sx * sb.width),
+					height: Math.abs(sy * sb.height),
+				};
+				this.dragFrom = w;
+				this.damage.addAll();
+				this.indexDirty = true;
+				this.scheduleRepaint("partial");
+				this.repaintPath(path);
+				this.redrawSelectionUI();
+				return;
+			}
 			const dx = w.x - this.dragFrom.x;
 			const dy = w.y - this.dragFrom.y;
 			// Live drag only translates coordinates in the store; the history
@@ -5049,10 +5164,34 @@ export class InkOverlayPlugin {
 	private lassoUp(): void {
 		if (this.dragTotal) {
 			const { dx, dy } = this.dragTotal;
+			const wasResize = this.resizeHandle !== null;
+			const resizeOld = this.resizeOriginal;
 			this.dragFrom = null;
 			this.dragTotal = null;
+			this.resizeHandle = null;
+			this.resizeStartBounds = null;
+			this.resizeLastBounds = null;
+			this.resizeOriginal = null;
 			const path = this.filePath();
-			if (path && (dx !== 0 || dy !== 0)) {
+			if (path && wasResize && resizeOld && resizeOld.length) {
+				// Same "replace" shape the eraser commits with above: the
+				// pre-resize strokes are the removal, the post-resize
+				// strokes (looked up fresh, by the ids the gesture froze)
+				// are the insertion, so undo restores the original size.
+				const now = this.strokesHere()
+					.filter((s) => resizeOld.some((o) => o.id === s.id))
+					.map((s) => ({ ...s, points: s.points.map((p) => ({ ...p })), bbox: { ...s.bbox } }));
+				inlineInk.save(path);
+				this.dispatchInk({
+					type: "replace",
+					path,
+					removed: resizeOld,
+					removedAt: resizeOld.map((o) => this.strokesHere().findIndex((s) => s.id === o.id)),
+					inserted: now,
+					insertedAt: now.map((s) => this.strokesHere().findIndex((x) => x.id === s.id)),
+				});
+				this.frontierCache.invalidate(path);
+			} else if (path && (dx !== 0 || dy !== 0)) {
 				// The op freezes WHICH strokes moved. An old move must never
 				// later act on whatever happens to be selected.
 				const strokeIds = [...this.selection.strokeIds];
@@ -5428,6 +5567,10 @@ export class InkOverlayPlugin {
 		this.lassoActive = false;
 		this.dragFrom = null;
 		this.dragTotal = null;
+		this.resizeHandle = null;
+		this.resizeStartBounds = null;
+		this.resizeLastBounds = null;
+		this.resizeOriginal = null;
 		this.spaceLineY = null;
 		this.spaceIds = [];
 		this.spaceBounds = null;

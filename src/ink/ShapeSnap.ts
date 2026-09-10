@@ -246,8 +246,7 @@ function classifyClosed(body: readonly P[], gapFrac: number): SnapResult | null 
 	// other's non-max-suppression window and half of them get silently
 	// dropped. Its own pass, straight on the radial profile (distance from
 	// centroid around the ring), does not depend on that resolution and
-	// runs independently rather than gated on `strong`. Ported from
-	// justwrite.
+	// runs independently rather than gated on `strong`.
 	const star = classifyStar(ring, cx, cy, diag, onChord);
 	if (star) return star;
 
@@ -347,7 +346,6 @@ function classifyClosed(body: readonly P[], gapFrac: number): SnapResult | null 
  * search's non-max-suppression window can reliably separate, dropping
  * half of them. A star's radius simply alternates far/near/far/near five
  * times, which is a smaller, more direct signal to look for directly.
- * Ported from justwrite.
  */
 function classifyStar(
 	ring: readonly P[],
@@ -483,7 +481,6 @@ function polygonFitError(
  * HEAD_ANGLE: half-opening angle of the arrowhead (radians).
  * HEAD_MAX_PX: absolute cap on the arrowhead arm so oversized drawn wings
  *   do not produce an unreadably huge synthesized head.
- * Ported from justwrite.
  */
 const ARROW_HEAD_RATIO = 0.18;
 const ARROW_HEAD_ANGLE = (Math.PI * 25) / 180; // 25 deg
@@ -533,7 +530,7 @@ function synthArrow(shaftBody: readonly P[], tip: P, shaftLen: number): InkPoint
 }
 
 /**
- * Arrow recognition for open strokes. Ported from justwrite.
+ * Arrow recognition for open strokes
  *
  *  1. The tail is simply where the stroke started (body[0]). The tip is
  *     the point FARTHEST from the tail. A real arrowhead's wings sweep
@@ -572,20 +569,6 @@ const ARROW_FLUTTER_MIN_ABS = 2.5;
 // whole shaft still has to pass the path-ratio scribble check below.
 const ARROW_MAX_PATH_RATIO = 3.8; // pathLength / shaftLen ceiling before it's "wandering", not an arrow
 const ARROW_TIP_HYSTERESIS = 2; // world units a candidate must clear the current tip by to replace it
-// justwrite's own wandering-scribble guard (path-length ratio) does not
-// catch a short, regular zigzag: consecutive back-and-forth segments keep
-// the traced/shaftLen ratio surprisingly low even though the shape is
-// nothing like an arrow (hardware regression, handwriting's own
-// SnapChipOffer fixture: a 16-point zigzag has ratio ~2.7, under the 3.8
-// ceiling, and both wings register because the oscillation reaches past
-// the tip radius on both sides). The distinguishing evidence a path-ratio
-// check misses: on a REAL arrow the shaft OUTSIDE the arrowhead's zone is
-// close to straight - only the last few samples peel away from the axis.
-// A zigzag has no straight shaft at all; every segment is off-axis. This
-// checks straightness of the shaft-only points (outside the tip radius)
-// against the tail-tip axis, same tolerance style as the line/rectangle
-// checks above; a deliberately bowed shaft (see the "crooked shaft" test)
-// still clears it comfortably, a zigzag does not.
 const ARROW_SHAFT_STRAIGHTNESS = 0.1; // max shaft-only perpendicular deviation, fraction of shaftLen
 
 interface WingScan {
@@ -603,7 +586,7 @@ interface WingScan {
  * when there isn't even enough shaft to consider (too short, or the ink
  * wandered too much to trust a tail-to-tip axis at all) - that's "no
  * evidence either way", not "definitely not an arrow", and callers treat
- * it as such. Ported from justwrite.
+ * it as such.
  */
 function scanForWings(body: readonly P[]): WingScan | null {
 	if (body.length < 12) return null;
@@ -704,7 +687,7 @@ function classifyOpen(body: readonly P[]): SnapResult | null {
 	// overwhelmingly less likely to be rewritten as an arrow. Because the
 	// scan starts after the tip, the check is also directional: a small
 	// oscillation while approaching the tip cannot manufacture the missing
-	// second wing. Ported from justwrite.
+	// second wing.
 	const scan = scanForWings(body);
 	if (scan && scan.positiveWing && scan.negativeWing) {
 		const shaftBody = body.slice(0, scan.shaftEndIdx + 1);

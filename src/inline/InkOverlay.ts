@@ -1264,7 +1264,7 @@ export class InkOverlayPlugin {
 	private lassoActive = false;
 	private dragFrom: { x: number; y: number } | null = null;
 	private dragTotal: { dx: number; dy: number } | null = null;
-	// ---- lasso resize (ported from justwrite) --------------------------------
+	// ---- lasso resize
 	// A resize reuses dragFrom/dragTotal to drive the same pointer-move
 	// plumbing a plain drag does; these four just say WHICH handle is held
 	// and what the selection looked like when the gesture grabbed it, so
@@ -4973,9 +4973,7 @@ export class InkOverlayPlugin {
 
 	/**
 	 * Which resize handle (if any) a world-space point is near, for a given
-	 * selection box. Ported from justwrite: eight grab points, corners and
-	 * edge midpoints, picked by nearest-within-pad rather than an exact hit,
-	 * since a fingertip or a pen tip is never pixel-exact over a 4px dot.
+	 * selection box.
 	 */
 	private selectionHandleAt(
 		p: { x: number; y: number },

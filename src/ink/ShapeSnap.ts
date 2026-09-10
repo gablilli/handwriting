@@ -4,7 +4,7 @@ import { computeBBox } from "./Stroke";
 /**
  * Handwriting to shapes (roadmap, 2026-08-27). Hold the pen still at the
  * end of a stroke and the wobbly figure snaps to the clean one you meant:
- * line, triangle, rectangle, circle or ellipse.
+ * line, triangle, rectangle, circle, ellipse, arrow or star.
  *
  * The dwell IS the request. Recognition never runs on an ordinary lift,
  * so nothing about normal writing changes - a deliberate ~third-of-a-
@@ -33,7 +33,7 @@ const LINE_TOLERANCE = 0.05;
 /** Synthesized point spacing in world units. */
 const SYNTH_STEP = 3;
 
-export type SnappedKind = "line" | "triangle" | "rectangle" | "circle" | "ellipse";
+export type SnappedKind = "line" | "triangle" | "rectangle" | "circle" | "ellipse" | "arrow" | "star";
 
 export interface SnapResult {
 	kind: SnappedKind;
@@ -239,6 +239,18 @@ function classifyClosed(body: readonly P[], gapFrac: number): SnapResult | null 
 	}
 	let strong: P[] = strongIdx.map((i) => ring[i]!);
 
+	// A five-pointed star drawn point-to-point without lifting the pen has
+	// ten corners packed into one ring, tighter than the generic
+	// curvature-peak search above (tuned for triangle/rectangle/circle)
+	// can reliably resolve - adjacent tip/valley corners fall inside each
+	// other's non-max-suppression window and half of them get silently
+	// dropped. Its own pass, straight on the radial profile (distance from
+	// centroid around the ring), does not depend on that resolution and
+	// runs independently rather than gated on `strong`. Ported from
+	// justwrite.
+	const star = classifyStar(ring, cx, cy, diag, onChord);
+	if (star) return star;
+
 	// FIT-VERIFIED synthesis: the shape has to actually hug the drawn
 	// outline to win. One rounded corner kept slipping under every
 	// threshold and squares came out triangles (hardware, 2026-08-27) -
@@ -328,6 +340,89 @@ function classifyClosed(body: readonly P[], gapFrac: number): SnapResult | null 
  * Averages a few samples at each end for a stable direction; null when the
  * lines are near-parallel or the intersection flies far outside the figure.
  */
+/**
+ * Five-pointed star, found on the ring's radial profile (distance from the
+ * centroid around the outline) rather than the shared curvature-peak
+ * search: ten corners packed into one ring sit closer together than that
+ * search's non-max-suppression window can reliably separate, dropping
+ * half of them. A star's radius simply alternates far/near/far/near five
+ * times, which is a smaller, more direct signal to look for directly.
+ * Ported from justwrite.
+ */
+function classifyStar(
+	ring: readonly P[],
+	cx: number,
+	cy: number,
+	diag: number,
+	onChord: (i: number) => boolean
+): SnapResult | null {
+	const N = ring.length;
+	const r = ring.map((p) => Math.hypot(p.x - cx, p.y - cy));
+
+	// Local extrema of the radial profile, each at least MIN_GAP samples
+	// from the last one accepted (a star's ten corners are evenly spaced;
+	// noise produces extra tiny wiggles much closer together than that).
+	const MIN_GAP = Math.floor(N / 14);
+	function extrema(wantMax: boolean): number[] {
+		const idx: number[] = [];
+		for (let i = 0; i < N; i++) {
+			if (onChord(i)) continue;
+			const prev = r[(i - 1 + N) % N]!;
+			const cur = r[i]!;
+			const next = r[(i + 1) % N]!;
+			const isPeak = wantMax ? cur >= prev && cur >= next : cur <= prev && cur <= next;
+			if (!isPeak) continue;
+			if (idx.length > 0 && Math.min(i - idx[idx.length - 1]!, N - (i - idx[idx.length - 1]!)) < MIN_GAP) {
+				// Keep whichever of the two nearby candidates is the more
+				// extreme point rather than just the first one found.
+				const better = wantMax ? cur > r[idx[idx.length - 1]!]! : cur < r[idx[idx.length - 1]!]!;
+				if (better) idx[idx.length - 1] = i;
+				continue;
+			}
+			idx.push(i);
+		}
+		// Wrap-around: the first and last accepted peaks may really be the
+		// same one straddling index 0.
+		if (idx.length > 1) {
+			const first = idx[0]!;
+			const last = idx[idx.length - 1]!;
+			if (Math.min(first + (N - last), N - (first + (N - last))) < MIN_GAP) idx.pop();
+		}
+		return idx;
+	}
+
+	const maxima = extrema(true);
+	const minima = extrema(false);
+	if (maxima.length !== 5 || minima.length !== 5) return null;
+
+	// Outer tips and inner valleys must actually alternate around the
+	// ring, and the tips must reach well past the valleys - otherwise
+	// this is some other ten-cornered wobble, not a star.
+	const tagged = [...maxima.map((i) => ({ i, outer: true })), ...minima.map((i) => ({ i, outer: false }))].sort(
+		(a, b) => a.i - b.i
+	);
+	for (let k = 0; k < 10; k++) {
+		if (tagged[k]!.outer === tagged[(k + 1) % 10]!.outer) return null;
+	}
+	const outerAvg = maxima.reduce((s, i) => s + r[i]!, 0) / 5;
+	const innerAvg = minima.reduce((s, i) => s + r[i]!, 0) / 5;
+	if (outerAvg < innerAvg * 1.3) return null;
+	if (outerAvg * 2 < diag * 0.3) return null; // too small to be a confident read
+
+	// Fit check against a regular star at this radius pair, oriented from
+	// the first detected tip - same bar the other shapes hold to.
+	const startAngle = Math.atan2(ring[maxima[0]!]!.y - cy, ring[maxima[0]!]!.x - cx);
+	const idealCorners: P[] = [];
+	for (let k = 0; k < 10; k++) {
+		const rad = k % 2 === 0 ? outerAvg : innerAvg;
+		const angle = startAngle + (k * Math.PI) / 5;
+		idealCorners.push({ x: cx + Math.cos(angle) * rad, y: cy + Math.sin(angle) * rad });
+	}
+	if (polygonFitError(ring, idealCorners, diag, onChord) > 0.12) return null;
+
+	return { kind: "star", points: synthPolygon(idealCorners) };
+}
+
 function completeGapCorner(body: readonly P[], w: number, h: number): P | null {
 	const m = Math.min(6, Math.floor(body.length / 4));
 	if (m < 2) return null;
@@ -382,7 +477,242 @@ function polygonFitError(
 	return total / counted / diag;
 }
 
+/**
+ * Synthesize an arrow: curved shaft from the body points, clean arrowhead at tip.
+ * HEAD_RATIO: arrowhead arm length relative to shaft length.
+ * HEAD_ANGLE: half-opening angle of the arrowhead (radians).
+ * HEAD_MAX_PX: absolute cap on the arrowhead arm so oversized drawn wings
+ *   do not produce an unreadably huge synthesized head.
+ * Ported from justwrite.
+ */
+const ARROW_HEAD_RATIO = 0.18;
+const ARROW_HEAD_ANGLE = (Math.PI * 25) / 180; // 25 deg
+const ARROW_HEAD_MAX_PX = 60; // world-unit ceiling for the arm length
+
+/**
+ * Synthesize an arrow that keeps the drawn shaft curve but replaces the
+ * arrowhead with a clean, proportional one.
+ *
+ * shaftBody: the stroke points from tail up to (but not past) where the
+ *   arrowhead wings begin. The last point in this array is near the tip.
+ * tip: the geometrically farthest point from the tail (the apex).
+ * shaftLen: straight-line distance tail-to-tip, used to size the arrowhead.
+ */
+function synthArrow(shaftBody: readonly P[], tip: P, shaftLen: number): InkPoint[] {
+	// The synthesized head must be symmetric around the same axis used to
+	// recognize the arrow. Using the last few hand-drawn samples made the
+	// two wings skew whenever the approach was curved or noisy.
+	const tail = shaftBody[0]!;
+	const angle = Math.atan2(tip.y - tail.y, tip.x - tail.x);
+
+	// Cap the arrowhead arm: proportional to shaft but never huge.
+	const headLen = Math.min(shaftLen * ARROW_HEAD_RATIO, ARROW_HEAD_MAX_PX);
+	const leftWing: P = {
+		x: tip.x - headLen * Math.cos(angle - ARROW_HEAD_ANGLE),
+		y: tip.y - headLen * Math.sin(angle - ARROW_HEAD_ANGLE),
+	};
+	const rightWing: P = {
+		x: tip.x - headLen * Math.cos(angle + ARROW_HEAD_ANGLE),
+		y: tip.y - headLen * Math.sin(angle + ARROW_HEAD_ANGLE),
+	};
+
+	// The snapped arrow uses the same straight-line synthesis as a snapped
+	// line. The user's hand-drawn shaft is only evidence for recognition; once
+	// accepted, the geometry is deliberately exact and can never carry the
+	// original bow through the snap.
+	const shaftPts = synthSegment(tail, tip);
+	const headT = shaftPts.length * 8;
+
+	// Exact straight shaft, then left wing, back to tip, then right wing.
+	return [
+		...shaftPts,
+		...synthSegment(tip, leftWing, headT),
+		...synthSegment(leftWing, tip, headT + 100),
+		...synthSegment(tip, rightWing, headT + 200),
+	];
+}
+
+/**
+ * Arrow recognition for open strokes. Ported from justwrite.
+ *
+ *  1. The tail is simply where the stroke started (body[0]). The tip is
+ *     the point FARTHEST from the tail. A real arrowhead's wings sweep
+ *     BACKWARD, toward the tail, so they sit closer to the tail than the
+ *     tip does - the tip search is naturally immune to a big or lopsided
+ *     arrowhead hijacking it.
+ *  2. No straightness test on the shaft. A hand-drawn shaft that bows or
+ *     kinks is still obviously meant as a straight arrow - the synthesized
+ *     result is always a clean line. Instead, a single sanity check
+ *     replaces it: total path length versus tail-to-tip distance. A shaft
+ *     (even a bowed one) plus a normal arrowhead retraces only a little;
+ *     an actual scribble backtracks constantly and blows well past that.
+ *  3. Ink spatially near the tip (within ARROW_TIP_RADIUS of shaft length)
+ *     counts as a wing once it deviates PERPENDICULARLY from the tail-tip
+ *     axis by at least ARROW_FLUTTER_MIN (fraction of shaft length). Both
+ *     sides of the head have to clear the flutter bar; this keeps ordinary
+ *     scribbles and end-of-line wrist jitter freehand.
+ *
+ * The shaft length gate matches MIN_PATH_LENGTH; a short flutter on a short
+ * stroke is too ambiguous to classify as an arrow.
+ */
+const ARROW_TIP_RADIUS = 0.62; // fraction of shaft length = "near the tip"
+const ARROW_FLUTTER_MIN = 0.012; // min perp deviation fraction = arrowhead wing
+// A purely relative flutter bar is fine for a long shaft but nearly free on a
+// short one: 3% of a 30-unit line is under 1px, so ordinary hand tremor at
+// the very end of an intentional short line crossed it and every such line
+// snapped to an arrow it was never meant to be. A wing has to clear this
+// many world units regardless of how short the shaft is.
+const ARROW_FLUTTER_MIN_ABS = 2.5;
+// Wing evidence is the PEAK deviation on each side of the axis within the
+// tip zone, not a run of consecutive same-sign samples: a real arrowhead
+// drawn quickly flutters back and forth almost every sample, so consecutive
+// samples legitimately alternate sign. A single noisy sample still can't
+// fake a wing on its own: it would have to clear the flutter bar on BOTH
+// sides of the axis, which ordinary jitter essentially never does, and the
+// whole shaft still has to pass the path-ratio scribble check below.
+const ARROW_MAX_PATH_RATIO = 3.8; // pathLength / shaftLen ceiling before it's "wandering", not an arrow
+const ARROW_TIP_HYSTERESIS = 2; // world units a candidate must clear the current tip by to replace it
+// justwrite's own wandering-scribble guard (path-length ratio) does not
+// catch a short, regular zigzag: consecutive back-and-forth segments keep
+// the traced/shaftLen ratio surprisingly low even though the shape is
+// nothing like an arrow (hardware regression, handwriting's own
+// SnapChipOffer fixture: a 16-point zigzag has ratio ~2.7, under the 3.8
+// ceiling, and both wings register because the oscillation reaches past
+// the tip radius on both sides). The distinguishing evidence a path-ratio
+// check misses: on a REAL arrow the shaft OUTSIDE the arrowhead's zone is
+// close to straight - only the last few samples peel away from the axis.
+// A zigzag has no straight shaft at all; every segment is off-axis. This
+// checks straightness of the shaft-only points (outside the tip radius)
+// against the tail-tip axis, same tolerance style as the line/rectangle
+// checks above; a deliberately bowed shaft (see the "crooked shaft" test)
+// still clears it comfortably, a zigzag does not.
+const ARROW_SHAFT_STRAIGHTNESS = 0.1; // max shaft-only perpendicular deviation, fraction of shaftLen
+
+interface WingScan {
+	tail: P;
+	tip: P;
+	tipIndex: number;
+	shaftLen: number;
+	shaftEndIdx: number;
+	positiveWing: boolean;
+	negativeWing: boolean;
+}
+
+/**
+ * Shared tip + wing evidence gathering for arrow recognition. Returns null
+ * when there isn't even enough shaft to consider (too short, or the ink
+ * wandered too much to trust a tail-to-tip axis at all) - that's "no
+ * evidence either way", not "definitely not an arrow", and callers treat
+ * it as such. Ported from justwrite.
+ */
+function scanForWings(body: readonly P[]): WingScan | null {
+	if (body.length < 12) return null;
+
+	// 1. Tail = where the stroke started. Tip = farthest point from it.
+	//    A candidate has to beat the current farthest point by more than
+	//    plain jitter before it takes over, so the true shaft end isn't
+	//    discarded for a few tenths of a world unit of noise.
+	const tail = body[0]!;
+	let tip = tail;
+	let tipIndex = 0;
+	let shaftLen = 0;
+	for (let i = 1; i < body.length; i++) {
+		const d = dist(tail, body[i]!);
+		if (d > shaftLen + ARROW_TIP_HYSTERESIS) {
+			shaftLen = d;
+			tip = body[i]!;
+			tipIndex = i;
+		}
+	}
+	if (shaftLen < MIN_PATH_LENGTH) return null;
+
+	// 2. Reject genuine scribbles: a shaft (bowed or not) plus an
+	//    arrowhead retraces only a little ground relative to how far it
+	//    ultimately got from the tail.
+	let traced = 0;
+	for (let i = 1; i < body.length; i++) traced += dist(body[i - 1]!, body[i]!);
+	if (traced > shaftLen * ARROW_MAX_PATH_RATIO) return null;
+
+	// 3. Ink near the tip that strays off the tail-tip axis is a wing.
+	//    Track the first index that enters the arrowhead zone so we can
+	//    split the shaft from the head geometry for synthesis.
+	const ux = (tip.x - tail.x) / shaftLen;
+	const uy = (tip.y - tail.y) / shaftLen;
+	const tipRadius = shaftLen * ARROW_TIP_RADIUS;
+	const flutterThreshold = Math.max(shaftLen * ARROW_FLUTTER_MIN, ARROW_FLUTTER_MIN_ABS);
+	let shaftEndIdx = body.length - 1;
+	let maxPerp = -Infinity;
+	let minPerp = Infinity;
+	// Search the whole tip neighbourhood rather than relying on the exact
+	// sample index at which the user touched the tip: on real pen input
+	// the farthest sample is often one of the first wing samples, or the
+	// user briefly overshoots the corner. Requiring BOTH sides of the axis
+	// still prevents a bowed shaft / single-wing attempt from becoming an
+	// arrow.
+	for (let i = 1; i < body.length; i++) {
+		const p = body[i]!;
+		if (dist(p, tip) > tipRadius) continue;
+		// First post-tip sample inside the arrowhead zone - shaft ends just
+		// before the actual head. If the farthest sample itself is already a
+		// wing, tipIndex remains the natural shaft endpoint.
+		if (i > tipIndex && shaftEndIdx === body.length - 1) shaftEndIdx = Math.max(0, tipIndex);
+		const vx = p.x - tail.x;
+		const vy = p.y - tail.y;
+		const signedPerp = vx * uy - vy * ux;
+		if (signedPerp > maxPerp) maxPerp = signedPerp;
+		if (signedPerp < minPerp) minPerp = signedPerp;
+	}
+
+	// 4. The shaft itself - everything OUTSIDE the tip zone - has to
+	//    actually be a shaft: close to the tail-tip axis. A zigzag drawn
+	//    at any scale reaches the tip zone's wing thresholds exactly the
+	//    same way a real arrowhead does (see ARROW_SHAFT_STRAIGHTNESS's
+	//    own comment), but its "shaft" is off-axis everywhere, not just
+	//    at the very end. Skip if there is no shaft left to check - a
+	//    tiny shaft is caught by MIN_PATH_LENGTH above already.
+	let shaftDev = 0;
+	let shaftSamples = 0;
+	for (let i = 1; i < body.length; i++) {
+		const p = body[i]!;
+		if (dist(p, tip) <= tipRadius) continue;
+		const vx = p.x - tail.x;
+		const vy = p.y - tail.y;
+		const perp = Math.abs(vx * uy - vy * ux);
+		if (perp > shaftDev) shaftDev = perp;
+		shaftSamples++;
+	}
+	if (shaftSamples > 0 && shaftDev > shaftLen * ARROW_SHAFT_STRAIGHTNESS) {
+		return { tail, tip, tipIndex, shaftLen, shaftEndIdx, positiveWing: false, negativeWing: false };
+	}
+
+	return {
+		tail,
+		tip,
+		tipIndex,
+		shaftLen,
+		shaftEndIdx,
+		positiveWing: maxPerp > flutterThreshold,
+		negativeWing: minPerp < -flutterThreshold,
+	};
+}
+
 function classifyOpen(body: readonly P[]): SnapResult | null {
+	// Try arrow first: an arrow is a strict superset of a line, so a line
+	// that happens to have flutter at one end would otherwise win the wrong
+	// shape. A real arrowhead has two sides - requiring one wing on each
+	// side makes ordinary scribbles and end-of-line wrist jitter
+	// overwhelmingly less likely to be rewritten as an arrow. Because the
+	// scan starts after the tip, the check is also directional: a small
+	// oscillation while approaching the tip cannot manufacture the missing
+	// second wing. Ported from justwrite.
+	const scan = scanForWings(body);
+	if (scan && scan.positiveWing && scan.negativeWing) {
+		const shaftBody = body.slice(0, scan.shaftEndIdx + 1);
+		return {
+			kind: "arrow",
+			points: synthArrow(shaftBody.length > 1 ? shaftBody : [scan.tail], scan.tip, scan.shaftLen),
+		};
+	}
 	const a = body[0]!;
 	const b = body[body.length - 1]!;
 	const len = dist(a, b);
@@ -393,16 +723,26 @@ function classifyOpen(body: readonly P[]): SnapResult | null {
 		if (d > worst) worst = d;
 	}
 	if (worst > len * LINE_TOLERANCE) return null;
+
+	// A single wing is ambiguous only when it is genuinely visible as a
+	// separate hook. Tiny end jitter on an otherwise straight line must not
+	// suppress the line snap. Use a tighter line-fit test for the one-wing
+	// case: a clean line remains a line; a clearly hooked one-wing arrow
+	// stays freehand.
+	if (scan && (scan.positiveWing || scan.negativeWing)) {
+		const ONE_WING_LINE_TOLERANCE = 0.045;
+		if (worst > len * ONE_WING_LINE_TOLERANCE) return null;
+	}
 	return { kind: "line", points: synthSegment(a, b) };
 }
 
-function synthSegment(a: P, b: P): InkPoint[] {
+function synthSegment(a: P, b: P, tOffset = 0): InkPoint[] {
 	const len = dist(a, b);
 	const n = Math.max(2, Math.ceil(len / SYNTH_STEP));
 	const out: InkPoint[] = [];
 	for (let i = 0; i <= n; i++) {
 		const f = i / n;
-		out.push({ x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f, pressure: 0.5, t: i * 8 });
+		out.push({ x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f, pressure: 0.5, t: tOffset + i * 8 });
 	}
 	return out;
 }
